@@ -3,8 +3,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch
+import gc
+import os
 from typing import Optional
 import uvicorn
+import psutil
 
 # Initialize FastAPI app
 app = FastAPI(title="Luna Women's Health Chatbot API", version="1.0.0")
@@ -12,10 +15,10 @@ app = FastAPI(title="Luna Women's Health Chatbot API", version="1.0.0")
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],  # Allows all methods
-    allow_headers=["*"],  # Allows all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # Request/Response models
@@ -25,17 +28,30 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     success: bool
     response: str
-    message_type: str  # "normal", "emergency", "out_of_domain"
-    
+    message_type: str
+
 # Global variables for model and tokenizer
 model = None
 tokenizer = None
+
+def log_memory_usage(stage: str):
+    """Log current memory usage"""
+    process = psutil.Process()
+    memory_mb = process.memory_info().rss / 1024 / 1024
+    print(f"Memory usage at {stage}: {memory_mb:.2f} MB")
+
+def cleanup_memory():
+    """Force garbage collection and clear cache"""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 class WomensHealthChatbot:
     def __init__(self, model, tokenizer):
         self.model = model
         self.tokenizer = tokenizer
-        self.model.eval()
+        if self.model:
+            self.model.eval()
         
         # Emergency keywords
         self.emergency_keywords = {
@@ -57,7 +73,9 @@ class WomensHealthChatbot:
             'birth control', 'ovulation', 'cramps', 'discharge', 'infection',
             'health', 'pain', 'symptoms', 'doctor', 'medical', 'pregnant',
             'cycle', 'bleeding', 'contraceptive', 'reproductive', 'sex', 'sexual health','bleed',
-            'menstruation', 'wellness', 'obstetrics', 'gynecology', 'vulva',
+            'menstruation', 'wellness', 'obstetrics', 'gynecology', 'vulva', 'intercourse', 
+            'fertility awareness', 'prenatal', 'postnatal', 'hysterectomy', 'fibroids', 
+            'cervical health', 'vaginitis', 'premenstrual syndrome', 'pms', 'pelvic pain'
         ]
     
     def detect_emergency(self, message: str) -> Optional[str]:
@@ -73,36 +91,37 @@ class WomensHealthChatbot:
         message_lower = message.lower()
         return any(keyword in message_lower for keyword in self.health_keywords)
     
-    def clean_response(self, text: str) -> str:
-        """Clean and format the complete response"""
+    def smart_truncate(self, text: str) -> str:
+        """Truncate to complete sentences with medical disclaimer"""
         
-        # Remove any unwanted prefixes or suffixes
-        text = text.strip()
+        # Split into sentences
+        sentences = text.split('. ')
         
-        # Remove common model artifacts
-        unwanted_patterns = [
-            "USER:", "DOCTOR:", "Human:", "Assistant:", "AI:",
-            "Note:", "Disclaimer:", "Please note that"
-        ]
+        # Find optimal cutoff (aim for 2-3 complete sentences)
+        word_count = 0
+        selected_sentences = []
         
-        for pattern in unwanted_patterns:
-            if text.startswith(pattern):
-                text = text[len(pattern):].strip()
+        for sentence in sentences:
+            sentence_words = len(sentence.split())
+            if word_count + sentence_words <= 100:  # Slightly increased limit
+                selected_sentences.append(sentence)
+                word_count += sentence_words
+            else:
+                break
         
-        # Clean up extra whitespace and newlines
-        import re
-        text = re.sub(r'\n\s*\n', '\n\n', text)  # Remove excessive newlines
-        text = re.sub(r' +', ' ', text)  # Remove multiple spaces
+        # Join sentences
+        if selected_sentences:
+            result = '. '.join(selected_sentences)
+            if not result.endswith('.'):
+                result += '.'
+        else:
+            # Fallback: take first sentence
+            result = sentences[0] + '.'
         
-        # Ensure proper sentence ending
-        if text and not text.endswith(('.', '!', '?')):
-            text += '.'
+        # Add disclaimer
+        result += "\n\n💡 Please consult your healthcare provider for personalized advice."
         
-        # Add medical disclaimer if response is substantial
-        if len(text.split()) > 10:
-            text += "\n\n💡 Please consult your healthcare provider for personalized advice."
-        
-        return text
+        return result
     
     def generate_response(self, question: str) -> dict:
         """Generate response with safety checks"""
@@ -120,35 +139,48 @@ class WomensHealthChatbot:
         if not self.is_women_health_related(question):
             return {
                 "success": True,
-                "response": "🌸Hey there, I'm Luna a women's health specialist chatbot 💕 💖. I can help with questions about reproductive health, pregnancy, menstrual health, contraception, fertility, and other women's wellness topics🌈. Could you ask a women's health related question?✨",
+                "response": "🌸 Hey there, I'm Luna, a women's health specialist chatbot 💕. I can help with questions about reproductive health, pregnancy, menstrual health, contraception, fertility, and other women's wellness topics🌈. Could you ask a women's health related question?✨",
                 "message_type": "out_of_domain"
             }
         
         # Generate medical response
         try:
+            log_memory_usage("before generation")
+            
             prompt = f"USER: {question}\nDOCTOR:"
-            inputs = self.tokenizer(prompt, return_tensors="pt")
+            inputs = self.tokenizer(
+                prompt, 
+                return_tensors="pt", 
+                truncation=True, 
+                max_length=200,  # Limit input length
+                padding=False
+            )
             
             with torch.no_grad():
                 outputs = self.model.generate(
                     **inputs,
-                    max_length=150,         # Total sequence length (prompt + response)
-                    min_length=inputs['input_ids'].shape[1] + 20,  # Ensure minimum response length
-                    temperature=0.7,        # Slightly higher for more natural responses
+                    max_new_tokens=120,     # Balanced length
+                    min_new_tokens=15,      # Ensure minimum response
+                    temperature=0.8,        # Good creativity
                     do_sample=True,
-                    top_p=0.9,             # Allow more diverse vocabulary
-                    top_k=40,              # Limit to top 40 tokens for quality
+                    top_p=0.85,            # Focused sampling
+                    top_k=35,              # Reduce choices for speed
                     pad_token_id=self.tokenizer.eos_token_id,
-                    repetition_penalty=1.2,
+                    repetition_penalty=1.15,
                     no_repeat_ngram_size=2,
-                    num_beams=1           # greedy search for consistency
+                    early_stopping=True,
+                    use_cache=True
                 )
             
             response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
             generated_response = response.split("DOCTOR:")[-1].strip()
             
-            # Clean and format the complete response
-            generated_response = self.clean_response(generated_response)
+            # Smart truncation to complete sentences
+            generated_response = self.smart_truncate(generated_response)
+            
+            # Clean up memory after generation
+            cleanup_memory()
+            log_memory_usage("after generation")
             
             return {
                 "success": True,
@@ -157,9 +189,11 @@ class WomensHealthChatbot:
             }
             
         except Exception as e:
+            print(f"Generation error: {e}")
+            cleanup_memory()
             return {
                 "success": False,
-                "response": f"I apologize, but I'm having trouble generating a response right now. Please try again. Error: {str(e)}",
+                "response": f"I apologize, but I'm having trouble generating a response right now. Please try again.",
                 "message_type": "error"
             }
 
@@ -168,50 +202,77 @@ chatbot_instance = None
 
 @app.on_event("startup")
 async def load_model():
-    """Load model on startup"""
+    """Load model on startup with optimizations"""
     global model, tokenizer, chatbot_instance
     
     try:
-        print("Loading model from Hugging Face...")
+        log_memory_usage("startup")
+        print("Loading optimized model from Hugging Face...")
         
-       
         model_name = "JCholder/womens-health-chatbot"
         
-       
-        
         print(f"Downloading {model_name}...")
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
-        model = AutoModelForCausalLM.from_pretrained(model_name)
+        
+        # Load tokenizer first (smaller memory footprint)
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_name,
+            use_fast=True,  # Use fast tokenizer for better performance
+            padding_side="left"
+        )
+        
+        log_memory_usage("after tokenizer")
+        
+        # Load model with optimizations
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=torch.float16,  # Half precision saves ~50% memory
+            low_cpu_mem_usage=True,     # Reduce memory usage during loading
+            device_map="cpu",           # Force CPU usage (Railway doesn't have GPU on free tier)
+            trust_remote_code=True,     # Allow custom model code
+            use_cache=True             # Enable KV cache for faster generation
+        )
+        
+        log_memory_usage("after model loading")
         
         # Set pad token if not present
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
         
+        # Force garbage collection
+        cleanup_memory()
+        log_memory_usage("after cleanup")
+        
         # Initialize chatbot
         chatbot_instance = WomensHealthChatbot(model, tokenizer)
         
-        print("Model loaded successfully!")
+        print("✅ Model loaded successfully with optimizations!")
         
     except Exception as e:
-        print(f"Error loading model: {e}")
-        print("Falling back to a smaller model...")
+        print(f"❌ Error loading model: {e}")
+        print("🔄 Attempting to load fallback model...")
         
         try:
-            # Fallback to a smaller model
-            model_name = "microsoft/DialoGPT-small"
+            # Fallback to smaller model
+            model_name = "microsoft/DialoGPT-medium"
             print(f"Loading fallback model: {model_name}")
             
-            tokenizer = AutoTokenizer.from_pretrained(model_name)
-            model = AutoModelForCausalLM.from_pretrained(model_name)
+            tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                torch_dtype=torch.float16,
+                low_cpu_mem_usage=True,
+                device_map="cpu"
+            )
             
             if tokenizer.pad_token is None:
                 tokenizer.pad_token = tokenizer.eos_token
                 
+            cleanup_memory()
             chatbot_instance = WomensHealthChatbot(model, tokenizer)
-            print("Fallback model loaded successfully!")
+            print("✅ Fallback model loaded successfully!")
             
         except Exception as fallback_error:
-            print(f"Fallback model also failed: {fallback_error}")
+            print(f"❌ Fallback model also failed: {fallback_error}")
             raise
 
 @app.post("/chat", response_model=ChatResponse)
@@ -229,14 +290,19 @@ async def chat_endpoint(request: ChatRequest):
         return ChatResponse(**result)
         
     except Exception as e:
+        print(f"Chat endpoint error: {e}")
         raise HTTPException(status_code=500, detail=f"Error processing request: {str(e)}")
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint"""
+    """Health check endpoint with memory info"""
+    process = psutil.Process()
+    memory_mb = process.memory_info().rss / 1024 / 1024
+    
     return {
         "status": "healthy",
         "model_loaded": chatbot_instance is not None,
+        "memory_usage_mb": round(memory_mb, 2),
         "message": "Luna Women's Health Chatbot API is running"
     }
 
@@ -254,4 +320,5 @@ async def root():
     }
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
