@@ -132,14 +132,14 @@ class WomensHealthChatbot:
             with torch.no_grad():
                 outputs = self.model.generate(
                     **inputs,
-                    max_length=150,         # Total sequence length (prompt + response)
+                    max_length=80,         # Total sequence length (prompt + response)
                     min_length=inputs['input_ids'].shape[1] + 20,  # Ensure minimum response length
                     temperature=0.7,        # Slightly higher for more natural responses
                     do_sample=True,
                     top_p=0.9,             # Allow more diverse vocabulary
-                    top_k=40,              # Limit to top 40 tokens for quality
+                    top_k=20,              # Limit to top 40 tokens for quality
                     pad_token_id=self.tokenizer.eos_token_id,
-                    repetition_penalty=1.2,
+                    repetition_penalty=1.1,
                     no_repeat_ngram_size=2,
                     num_beams=1           # greedy search for consistency
                 )
